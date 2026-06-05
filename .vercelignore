@@ -1,0 +1,14 @@
+.DS_Store
+*.py[cod]
+__pycache__/
+
+.git/
+.vercel/
+
+frontend/node_modules/
+frontend/dist/
+frontend/*.tsbuildinfo
+
+backend/.env
+backend/.venv/
+backend/uploads/

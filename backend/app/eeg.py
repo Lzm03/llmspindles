@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import io
 import json
+import math
 import os
 import tempfile
 import uuid
@@ -15,7 +16,7 @@ import h5py
 from scipy import io as scipy_io
 from scipy import signal
 
-from .models import ArrayCandidate, FilterType, UploadResponse, WindowResponse
+from .models import ArrayCandidate, CandidateSegment, FilterType, UploadResponse, WindowResponse
 from .settings import DEFAULT_CHANNEL_LIMIT, MAX_WINDOW_POINTS, UPLOAD_DIR
 
 matplotlib.use("Agg")
@@ -104,7 +105,8 @@ def _load_edf_with_mne(path: Path) -> tuple[np.ndarray, float, list[str]]:
     except ImportError as exc:
         raise RuntimeError("EDF fallback support is not available in this deployment.") from exc
     raw = mne.io.read_raw_edf(path, preload=True, verbose="ERROR", infer_types=False)
-    data = raw.get_data()
+    # MNE returns Volts, while the rest of this application and YASA use µV.
+    data = raw.get_data() * 1e6
     sample_rate = float(raw.info["sfreq"])
     labels = [_clean_label(name, f"Ch {index + 1}") for index, name in enumerate(raw.ch_names)]
     return data, sample_rate, labels
@@ -430,7 +432,15 @@ def get_window(file_id: str, start_sec: float, duration_sec: float, channels_arg
     )
 
 
-def render_segment_png(file_id: str, start_sec: float, end_sec: float, channels: list[int], filter_type: FilterType) -> bytes:
+def render_segment_png(
+    file_id: str,
+    start_sec: float,
+    end_sec: float,
+    channels: list[int],
+    filter_type: FilterType,
+    target_start_sec: float | None = None,
+    target_end_sec: float | None = None,
+) -> bytes:
     meta, data = load_recording_metadata(file_id)
     selected = channels or list(range(min(meta.channel_count, DEFAULT_CHANNEL_LIMIT)))
     for idx in selected:
@@ -446,12 +456,20 @@ def render_segment_png(file_id: str, start_sec: float, end_sec: float, channels:
 
     fig_height = max(4, min(14, 0.45 * len(selected) + 2))
     fig, ax = plt.subplots(figsize=(13, fig_height), dpi=160)
+    if target_start_sec is not None and target_end_sec is not None:
+        ax.axvspan(times[0], target_start_sec, color="#d9e1de", alpha=0.62, zorder=0)
+        ax.axvspan(target_end_sec, times[-1], color="#d9e1de", alpha=0.62, zorder=0)
+        ax.axvline(target_start_sec, color="#0f8064", linewidth=1.1, linestyle="--")
+        ax.axvline(target_end_sec, color="#0f8064", linewidth=1.1, linestyle="--")
     for i, channel in enumerate(segment):
         ax.plot(times, channel + offsets[i], color="#172554", linewidth=0.7)
     ax.set_yticks(offsets)
     ax.set_yticklabels([meta.channel_labels[idx] if idx < len(meta.channel_labels) else f"Ch {idx + 1}" for idx in selected])
     ax.set_xlabel("Time (seconds)")
-    ax.set_title(f"EEG segment {start_sec:.2f}-{end_sec:.2f}s ({filter_type})")
+    title = f"EEG segment {start_sec:.2f}-{end_sec:.2f}s ({filter_type})"
+    if target_start_sec is not None and target_end_sec is not None:
+        title += f" | target epoch {target_start_sec:.2f}-{target_end_sec:.2f}s"
+    ax.set_title(title)
     ax.grid(axis="x", color="#d4d4d8", linewidth=0.6)
     ax.set_xlim(times[0], times[-1] if len(times) > 1 else times[0] + 1)
     ax.set_facecolor("#fbfbf8")
@@ -464,3 +482,110 @@ def render_segment_png(file_id: str, start_sec: float, end_sec: float, channels:
 
 def png_to_base64(png: bytes) -> str:
     return base64.b64encode(png).decode("ascii")
+
+
+def _smooth_signal(values: np.ndarray, width: int) -> np.ndarray:
+    if width <= 1:
+        return values
+    kernel = np.ones(width, dtype=float) / width
+    return np.apply_along_axis(lambda row: np.convolve(row, kernel, mode="same"), 1, values)
+
+
+def _find_contiguous_regions(mask: np.ndarray) -> list[tuple[int, int]]:
+    if mask.size == 0:
+        return []
+    edges = np.diff(mask.astype(np.int8), prepend=0, append=0)
+    starts = np.flatnonzero(edges == 1)
+    ends = np.flatnonzero(edges == -1)
+    return [(int(start), int(end)) for start, end in zip(starts, ends, strict=False)]
+
+
+def detect_spindle_candidates(
+    file_id: str,
+    start_sec: float,
+    end_sec: float,
+    channels: list[int],
+    review_window_sec: float,
+) -> list[CandidateSegment]:
+    meta, data = load_recording_metadata(file_id)
+    selected = channels or list(range(min(meta.channel_count, DEFAULT_CHANNEL_LIMIT)))
+    for idx in selected:
+        if idx < 0 or idx >= meta.channel_count:
+            raise ValueError(f"Channel index out of range: {idx}")
+    start = max(0, int(start_sec * meta.sampling_rate))
+    end = min(meta.sample_count, int(end_sec * meta.sampling_rate))
+    if end <= start:
+        return []
+
+    segment = np.asarray(data[np.asarray(selected), start:end], dtype=float)
+    # Remove channel DC offsets; YASA expects EEG amplitudes in microvolts.
+    segment -= np.nanmedian(segment, axis=1, keepdims=True)
+    try:
+        import yasa
+    except ImportError as exc:
+        raise RuntimeError("YASA spindle detection is not installed. Run: pip install -r requirements.txt") from exc
+
+    labels = [meta.channel_labels[index] if index < len(meta.channel_labels) else f"Ch {index + 1}" for index in selected]
+    # Use the YASA 0.6.5 publication-era defaults without overriding them:
+    # 12-15 Hz, 0.5-2 s, 500 ms merge distance, relative power 0.20,
+    # correlation 0.65, RMS 1.5 SD, and independent per-channel detection.
+    result = yasa.spindles_detect(segment, sf=meta.sampling_rate, ch_names=labels, verbose=False)
+    if result is None:
+        return []
+    rows = result.summary().sort_values("Start").to_dict("records")
+    if not rows:
+        return []
+
+    # YASA reports one row per channel. Merge temporally overlapping rows into
+    # one multi-channel physiological event before creating GPT review epochs.
+    groups: list[list[dict[str, Any]]] = []
+    for row in rows:
+        if groups and float(row["Start"]) <= max(float(item["End"]) for item in groups[-1]) + 0.15:
+            groups[-1].append(row)
+        else:
+            groups.append([row])
+
+    review_half_window = max(review_window_sec / 2, 1.5)
+    candidates: list[CandidateSegment] = []
+    for group in groups:
+        detected_start_sec = start_sec + min(float(row["Start"]) for row in group)
+        detected_end_sec = start_sec + max(float(row["End"]) for row in group)
+        peak_time_sec = start_sec + float(max(group, key=lambda row: float(row["RelPower"]))["Peak"])
+        detected_duration_sec = detected_end_sec - detected_start_sec
+        spectral_ratio = float(np.mean([float(row["RelPower"]) for row in group]))
+        event_channels = sorted({str(row["Channel"]) for row in group})
+
+        if abs(review_window_sec - 30.0) < 1e-6:
+            # GPT reviews fixed, recording-aligned 30-second epochs so that
+            # verification and downstream N2-like aggregation share boundaries.
+            candidate_start = math.floor(peak_time_sec / 30.0) * 30.0
+            candidate_end = min(meta.duration_sec, candidate_start + 30.0)
+        else:
+            candidate_start = max(start_sec, peak_time_sec - review_half_window)
+            candidate_end = min(end_sec, peak_time_sec + review_half_window)
+        if candidate_end - candidate_start < 2.0:
+            deficit = 2.0 - (candidate_end - candidate_start)
+            candidate_start = max(start_sec, candidate_start - deficit / 2)
+            candidate_end = min(end_sec, candidate_end + deficit / 2)
+
+        candidates.append(
+            CandidateSegment(
+                start_sec=round(candidate_start, 3),
+                end_sec=round(candidate_end, 3),
+                peak_time_sec=round(peak_time_sec, 3),
+                score=round(spectral_ratio, 4),
+                event_start_sec=round(detected_start_sec, 3),
+                event_end_sec=round(detected_end_sec, 3),
+                event_duration_sec=round(detected_duration_sec, 3),
+                spectral_ratio=round(spectral_ratio, 4),
+                waxing_score=None,
+                screening_reason=(
+                    "YASA 0.6.5 defaults: 12-15 Hz, 0.5-2.0 s, relative power >= 0.20, "
+                    "broad/sigma correlation >= 0.65, RMS >= mean + 1.5 SD."
+                ),
+                channels=event_channels,
+            )
+        )
+
+    candidates.sort(key=lambda item: item.event_start_sec or item.peak_time_sec)
+    return candidates

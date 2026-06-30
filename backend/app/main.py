@@ -1,17 +1,23 @@
 from __future__ import annotations
 
+import json
+from pathlib import Path
+
 from fastapi import FastAPI, File, Form, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import PlainTextResponse
+from fastapi.responses import PlainTextResponse, Response
 
 from .annotations import delete_annotation, delete_annotations_for_file, list_annotations, upsert_annotation
 from .eeg import _file_path, get_window, load_recording_metadata, png_to_base64, render_segment_png, save_upload
-from .llm import analyze_png
+from .llm import EPOCH_REVIEW_SCHEMA, analyze_n2_epoch_pair, analyze_png
 from .jobs import MAX_BATCH_SEGMENTS, cancel_job, create_job, delete_jobs_for_file, get_job, list_jobs, resume_incomplete_jobs
-from .models import AnalysisJob, Annotation, AnnotationInput, BatchAnalysisRequest, FilterType, RenderResponse, SegmentRequest, UploadResponse, WindowResponse
+from .models import AnalysisJob, Annotation, AnnotationInput, BatchAnalysisRequest, FilterType, GptPromptConfig, RenderResponse, SegmentRequest, SpindleSleepOnsetReport, UploadResponse, WindowResponse
+from .models import AutoN2PairRequest, AutoN2PairResult, SleepEpoch, SleepEpochInput, SleepOnsetResult
+from .sleep_epochs import backfill_spindle_negatives, delete_sleep_epoch, delete_sleep_epochs_for_file, derive_sleep_onset, find_spindle_onset_proxy, list_sleep_epochs, upsert_sleep_epoch
+from .sleep_onset import build_spindle_sleep_onset_report
 from .settings import MAX_RENDER_SECONDS, UPLOAD_DIR
 
-app = FastAPI(title="EEG Spindle Annotation MVP")
+app = FastAPI(title="EEG Stable Sleep-Onset Annotation")
 
 app.add_middleware(
     CORSMiddleware,
@@ -60,9 +66,122 @@ def delete_file(file_id: str) -> dict:
     metadata_path = UPLOAD_DIR / f"{file_id}.json"
     deleted_annotations = delete_annotations_for_file(file_id)
     deleted_jobs = delete_jobs_for_file(file_id)
+    deleted_sleep_epochs = delete_sleep_epochs_for_file(file_id)
     recording_path.unlink(missing_ok=True)
     metadata_path.unlink(missing_ok=True)
-    return {"deleted": True, "annotations_deleted": deleted_annotations, "jobs_deleted": deleted_jobs}
+    return {"deleted": True, "annotations_deleted": deleted_annotations, "jobs_deleted": deleted_jobs, "sleep_epochs_deleted": deleted_sleep_epochs}
+
+
+@app.get("/api/sleep-epochs", response_model=list[SleepEpoch])
+def sleep_epochs(file_id: str) -> list[SleepEpoch]:
+    return list_sleep_epochs(file_id)
+
+
+@app.post("/api/sleep-epochs", response_model=SleepEpoch)
+def save_sleep_epoch(payload: SleepEpochInput) -> SleepEpoch:
+    try:
+        saved = upsert_sleep_epoch(payload)
+        proxy_epoch = find_spindle_onset_proxy(list_sleep_epochs(payload.file_id))
+        if proxy_epoch is not None:
+            backfill_spindle_negatives(payload.file_id, proxy_epoch.epoch_index)
+        return saved
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.delete("/api/sleep-epochs/{file_id}/{epoch_index}")
+def remove_sleep_epoch(file_id: str, epoch_index: int) -> dict[str, bool]:
+    try:
+        delete_sleep_epoch(file_id, epoch_index)
+        return {"deleted": True}
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@app.get("/api/sleep-onset/{file_id}", response_model=SleepOnsetResult)
+def sleep_onset(file_id: str) -> SleepOnsetResult:
+    try:
+        load_recording_metadata(file_id)
+        return derive_sleep_onset(file_id)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@app.post("/api/auto-score-n2-pair", response_model=AutoN2PairResult)
+def auto_score_n2_pair(payload: AutoN2PairRequest) -> AutoN2PairResult:
+    try:
+        meta, _ = load_recording_metadata(payload.file_id)
+        first_start = payload.first_epoch_index * 30.0
+        if first_start + 60.0 > meta.duration_sec:
+            raise ValueError("Two complete 30-second epochs are required from the selected start.")
+        first_broad_png = render_segment_png(payload.file_id, first_start, first_start + 30.0, payload.channels, "broad")
+        second_broad_png = render_segment_png(payload.file_id, first_start + 30.0, first_start + 60.0, payload.channels, "broad")
+        assessments = analyze_n2_epoch_pair(
+            first_broad_png,
+            second_broad_png,
+            first_start,
+        )
+        existing = {item.epoch_index: item for item in list_sleep_epochs(payload.file_id)}
+        saved: list[SleepEpoch] = []
+        for assessment in assessments:
+            epoch_index = payload.first_epoch_index + assessment.epoch_offset
+            if epoch_index in existing and existing[epoch_index].source == "human":
+                saved.append(existing[epoch_index])
+                continue
+            confident_n2 = (
+                assessment.classification == "N2"
+                and assessment.confidence >= 0.8
+                and not assessment.arousal_or_artifact_present
+            )
+            saved.append(upsert_sleep_epoch(SleepEpochInput(
+                file_id=payload.file_id,
+                epoch_index=epoch_index,
+                stage="N2" if confident_n2 else "uncertain",
+                source="llm",
+                confidence=assessment.confidence,
+                spindle_present=assessment.spindle_present,
+                k_complex_present=assessment.k_complex_present,
+                arousal_present=assessment.arousal_or_artifact_present,
+                rationale=assessment.rationale,
+                notes="Auto-scored from broad-band views of two consecutive 30-second epochs.",
+            )))
+        return AutoN2PairResult(
+            assessments=assessments,
+            saved_epochs=saved,
+            sleep_onset=derive_sleep_onset(payload.file_id),
+        )
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.get("/api/sleep-epochs/export/{file_id}", response_class=PlainTextResponse)
+def export_sleep_epochs(file_id: str) -> PlainTextResponse:
+    try:
+        load_recording_metadata(file_id)
+        epochs = list_sleep_epochs(file_id)
+        proxy_epoch = find_spindle_onset_proxy(epochs)
+        if proxy_epoch is not None:
+            backfill_spindle_negatives(file_id, proxy_epoch.epoch_index)
+            epochs = list_sleep_epochs(file_id)
+        rows = [
+            "# criterion,first_two_consecutive_30s_epochs_with_definite_spindle",
+            f"# spindle_based_onset_proxy_sec,{'' if proxy_epoch is None else f'{proxy_epoch.start_time_sec:.3f}'}",
+            "epoch_index,start_sec,end_sec,spindle_present",
+        ]
+        for item in epochs:
+            rows.append(
+                f"{item.epoch_index},{item.start_time_sec:.3f},{item.end_time_sec:.3f},"
+                f"{str(item.spindle_present).lower()}"
+            )
+        return PlainTextResponse("\n".join(rows) + "\n", media_type="text/csv")
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
 
 
 @app.get("/api/eeg/window", response_model=WindowResponse)
@@ -94,6 +213,26 @@ def render_segment(payload: SegmentRequest) -> RenderResponse:
     try:
         png = render_segment_png(payload.file_id, payload.start_sec, payload.end_sec, payload.channels, payload.filter_type)
         return RenderResponse(image_base64=png_to_base64(png))
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.get("/api/review-epoch-image/{file_id}/{epoch_index}")
+def review_epoch_image(file_id: str, epoch_index: int, channels: str | None = None) -> Response:
+    try:
+        meta, _ = load_recording_metadata(file_id)
+        target_start = epoch_index * 30.0
+        target_end = target_start + 30.0
+        if target_end > meta.duration_sec:
+            raise ValueError("A complete 30-second epoch is required.")
+        selected = [int(value) for value in channels.split(",") if value.strip()] if channels else []
+        png = render_segment_png(
+            file_id, max(0.0, target_start - 5.0), min(meta.duration_sec, target_end + 5.0),
+            selected, "broad", target_start_sec=target_start, target_end_sec=target_end,
+        )
+        return Response(content=png, media_type="image/png")
     except FileNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except Exception as exc:
@@ -136,6 +275,20 @@ def annotations(file_id: str | None = None) -> list[Annotation]:
     return list_annotations(file_id)
 
 
+@app.get("/api/spindle-sleep-onset/{file_id}", response_model=SpindleSleepOnsetReport)
+def spindle_sleep_onset(file_id: str) -> SpindleSleepOnsetReport:
+    try:
+        meta, _ = load_recording_metadata(file_id)
+        subject_id = Path(meta.filename).stem or file_id
+        return build_spindle_sleep_onset_report(
+            subject_id=subject_id,
+            duration_sec=meta.duration_sec,
+            annotations=list_annotations(file_id),
+        )
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
 @app.post("/api/annotations", response_model=Annotation)
 def save_annotation(payload: AnnotationInput) -> Annotation:
     try:
@@ -174,8 +327,9 @@ def export_annotations(file_id: str) -> PlainTextResponse:
 
 
 @app.get("/api/analysis-jobs/config")
-def analysis_job_config() -> dict[str, int]:
-    return {"max_segments_per_job": MAX_BATCH_SEGMENTS}
+def analysis_job_config() -> dict:
+    config = GptPromptConfig().model_copy(update={"json_schema": json.dumps(EPOCH_REVIEW_SCHEMA, indent=2)})
+    return {"max_segments_per_job": MAX_BATCH_SEGMENTS, "prompt_config": config.model_dump()}
 
 
 @app.post("/api/analysis-jobs", response_model=AnalysisJob)

@@ -1,4 +1,4 @@
-import type { AnalysisJob, Annotation, AnnotationStatus, FilterType, LlmResult, UploadResponse, WindowResponse } from "./types";
+import type { AnalysisJob, Annotation, AnnotationStatus, AutoN2PairResult, FilterType, GptPromptConfig, LlmResult, SleepEpoch, SleepOnsetResult, SleepStage, SpindleSleepOnsetReport, UploadResponse, WindowResponse } from "./types";
 
 const jsonHeaders = { "Content-Type": "application/json" };
 
@@ -83,6 +83,72 @@ export async function fetchAnnotations(fileId: string): Promise<Annotation[]> {
   return readJson<Annotation[]>(await fetch(`/api/annotations?file_id=${encodeURIComponent(fileId)}`));
 }
 
+export async function fetchSleepEpochs(fileId: string): Promise<SleepEpoch[]> {
+  return readJson<SleepEpoch[]>(await fetch(`/api/sleep-epochs?file_id=${encodeURIComponent(fileId)}`));
+}
+
+export async function saveSleepEpoch(args: {
+  fileId: string;
+  epochIndex: number;
+  stage: SleepStage;
+  spindlePresent: boolean;
+  notes: string;
+}): Promise<SleepEpoch> {
+  return readJson<SleepEpoch>(await fetch("/api/sleep-epochs", {
+    method: "POST",
+    headers: jsonHeaders,
+    body: JSON.stringify({
+      file_id: args.fileId,
+      epoch_index: args.epochIndex,
+      stage: args.stage,
+      source: "human",
+      spindle_present: args.spindlePresent,
+      notes: args.notes
+    })
+  }));
+}
+
+export async function autoScoreN2Pair(args: {
+  fileId: string;
+  firstEpochIndex: number;
+  channels: number[];
+  filterType: FilterType;
+}): Promise<AutoN2PairResult> {
+  return readJson<AutoN2PairResult>(await fetch("/api/auto-score-n2-pair", {
+    method: "POST",
+    headers: jsonHeaders,
+    body: JSON.stringify({
+      file_id: args.fileId,
+      first_epoch_index: args.firstEpochIndex,
+      channels: args.channels,
+      filter_type: args.filterType
+    })
+  }));
+}
+
+export async function fetchSleepOnset(fileId: string): Promise<SleepOnsetResult> {
+  return readJson<SleepOnsetResult>(await fetch(`/api/sleep-onset/${encodeURIComponent(fileId)}`));
+}
+
+export async function fetchSpindleSleepOnset(fileId: string): Promise<SpindleSleepOnsetReport> {
+  return readJson<SpindleSleepOnsetReport>(await fetch(`/api/spindle-sleep-onset/${encodeURIComponent(fileId)}`));
+}
+
+export async function exportSleepEpochs(fileId: string): Promise<void> {
+  const response = await fetch(`/api/sleep-epochs/export/${encodeURIComponent(fileId)}`);
+  if (!response.ok) {
+    await readJson(response);
+    return;
+  }
+  const blob = await response.blob();
+  const url = URL.createObjectURL(blob);
+  const anchor = document.createElement("a");
+  anchor.href = url;
+  anchor.download = `spindle-epoch-gt-${fileId}.csv`;
+  anchor.click();
+  URL.revokeObjectURL(url);
+}
+
 export async function updateAnnotation(annotation: Annotation, status: AnnotationStatus): Promise<Annotation> {
   return readJson<Annotation>(
     await fetch("/api/annotations", {
@@ -130,6 +196,7 @@ export async function startAnalysisJob(args: {
   segmentDurationSec: number;
   channels: number[];
   filterType: FilterType;
+  promptConfig: GptPromptConfig;
 }): Promise<AnalysisJob> {
   return readJson<AnalysisJob>(
     await fetch("/api/analysis-jobs", {
@@ -141,7 +208,8 @@ export async function startAnalysisJob(args: {
         end_sec: args.endSec,
         segment_duration_sec: args.segmentDurationSec,
         channels: args.channels,
-        filter_type: args.filterType
+        filter_type: args.filterType,
+        prompt_config: args.promptConfig
       })
     })
   );
@@ -159,7 +227,7 @@ export async function cancelAnalysisJob(jobId: string): Promise<AnalysisJob> {
   return readJson<AnalysisJob>(await fetch(`/api/analysis-jobs/${encodeURIComponent(jobId)}/cancel`, { method: "POST" }));
 }
 
-export async function fetchJobConfig(): Promise<{ max_segments_per_job: number }> {
+export async function fetchJobConfig(): Promise<{ max_segments_per_job: number; prompt_config: GptPromptConfig }> {
   return readJson(await fetch("/api/analysis-jobs/config"));
 }
 

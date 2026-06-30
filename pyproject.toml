@@ -12,5 +12,6 @@ dependencies = [
   "matplotlib>=3.10.5",
   "openai==2.40.0",
   "python-dotenv==1.0.1",
-  "pydantic>=2.11.0"
+  "pydantic>=2.11.0",
+  "yasa==0.6.5"
 ]

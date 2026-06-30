@@ -23,11 +23,11 @@ import {
 } from "lucide-react";
 import Plot from "react-plotly.js";
 import * as api from "./api";
-import type { AnalysisJob, Annotation, FilterType, LlmResult, UploadResponse, WindowResponse } from "./types";
+import type { AnalysisJob, Annotation, FilterType, GptPromptConfig, LlmResult, N2EpochAssessment, SleepEpoch, SleepOnsetResult, SleepStage, SpindleSleepOnsetReport, UploadResponse, WindowResponse } from "./types";
 import "./styles.css";
 
 const filterOptions: FilterType[] = ["raw", "broad", "sigma"];
-const durationOptions = [5, 10, 30, 60];
+const durationOptions = [30, 60];
 const WORKSPACE_KEY = "spindle-lab-workspace-v1";
 const ANALYSIS_TIMING_KEY = "spindle-lab-analysis-timing-v1";
 
@@ -41,9 +41,9 @@ function App() {
   const [annotations, setAnnotations] = React.useState<Annotation[]>([]);
   const [filterType, setFilterType] = React.useState<FilterType>("broad");
   const [startSec, setStartSec] = React.useState(0);
-  const [durationSec, setDurationSec] = React.useState(10);
+  const [durationSec, setDurationSec] = React.useState(30);
   const [segmentStart, setSegmentStart] = React.useState(0);
-  const [segmentEnd, setSegmentEnd] = React.useState(10);
+  const [segmentEnd, setSegmentEnd] = React.useState(30);
   const [channelsText, setChannelsText] = React.useState("1-12");
   const [renderedImage, setRenderedImage] = React.useState<string | null>(null);
   const [llmResult, setLlmResult] = React.useState<LlmResult | null>(null);
@@ -51,9 +51,10 @@ function App() {
   const [error, setError] = React.useState<string | null>(null);
   const [batchStart, setBatchStart] = React.useState(0);
   const [batchEnd, setBatchEnd] = React.useState(60);
-  const [batchSegmentDuration, setBatchSegmentDuration] = React.useState(10);
+  const [batchSegmentDuration] = React.useState(30);
   const [activeJob, setActiveJob] = React.useState<AnalysisJob | null>(null);
   const [maxBatchSegments, setMaxBatchSegments] = React.useState(500);
+  const [promptConfig, setPromptConfig] = React.useState<GptPromptConfig | null>(null);
   const [restored, setRestored] = React.useState(false);
   const [singleAnalysisProgress, setSingleAnalysisProgress] = React.useState(0);
   const [singleAnalysisElapsed, setSingleAnalysisElapsed] = React.useState(0);
@@ -64,6 +65,13 @@ function App() {
   const [uploadSamplingRate, setUploadSamplingRate] = React.useState<number | "">("");
   const [manualChannelsText, setManualChannelsText] = React.useState("1-12");
   const [annotationMode, setAnnotationMode] = React.useState(false);
+  const [sleepEpochs, setSleepEpochs] = React.useState<SleepEpoch[]>([]);
+  const [sleepOnset, setSleepOnset] = React.useState<SleepOnsetResult | null>(null);
+  const [epochStage, setEpochStage] = React.useState<SleepStage>("uncertain");
+  const [spindlePresent, setSpindlePresent] = React.useState(false);
+  const [epochNotes, setEpochNotes] = React.useState("");
+  const [n2Assessments, setN2Assessments] = React.useState<N2EpochAssessment[]>([]);
+  const [spindleOnsetReport, setSpindleOnsetReport] = React.useState<SpindleSleepOnsetReport | null>(null);
 
   const selectedChannels = React.useMemo(() => parseChannels(channelsText, meta?.channel_count ?? 0), [channelsText, meta]);
   const manualChannels = React.useMemo(() => parseChannels(manualChannelsText, meta?.channel_count ?? 0), [manualChannelsText, meta]);
@@ -124,12 +132,16 @@ function App() {
     setManualChannelsText(initialChannelsText);
     setStartSec(0);
     setSegmentStart(0);
-    setSegmentEnd(Math.min(10, result.duration_sec));
+    setDurationSec(30);
+    setSegmentEnd(Math.min(30, result.duration_sec));
     setBatchStart(0);
     setBatchEnd(Math.min(60, result.duration_sec));
     const ann = await api.fetchAnnotations(result.file_id).catch(() => []);
     setAnnotations(ann);
-    const initialWindow = await api.fetchWindow({ fileId: result.file_id, startSec: 0, durationSec: 10, channels: initialChannels, filterType: "broad" });
+    setSleepEpochs(await api.fetchSleepEpochs(result.file_id).catch(() => []));
+    setSleepOnset(await api.fetchSleepOnset(result.file_id).catch(() => null));
+    setSpindleOnsetReport(await api.fetchSpindleSleepOnset(result.file_id).catch(() => null));
+    const initialWindow = await api.fetchWindow({ fileId: result.file_id, startSec: 0, durationSec: 30, channels: initialChannels, filterType: "broad" });
     setWindowData(initialWindow);
   }
 
@@ -166,14 +178,18 @@ function App() {
 
   async function analyze() {
     if (!meta) return;
+    const firstEpochIndex = Math.floor(startSec / 30);
+    if ((firstEpochIndex + 2) * 30 > meta.duration_sec) {
+      setError("Two complete 30-second epochs are required from the current position.");
+      return;
+    }
     const startedAt = performance.now();
     setSingleAnalysisProgress(2);
     setSingleAnalysisElapsed(0);
     const result = await run("analyze", () =>
-      api.analyzeSegment({
+      api.autoScoreN2Pair({
         fileId: meta.file_id,
-        startSec: segmentStart,
-        endSec: segmentEnd,
+        firstEpochIndex,
         channels: selectedChannels,
         filterType
       })
@@ -185,18 +201,25 @@ function App() {
     setSingleAnalysisEstimate(nextEstimate);
     localStorage.setItem(ANALYSIS_TIMING_KEY, String(nextEstimate));
     if (!result) return;
-    setLlmResult(result.result);
-    setAnnotations(await api.fetchAnnotations(meta.file_id));
+    setN2Assessments(result.assessments);
+    setSleepEpochs(await api.fetchSleepEpochs(meta.file_id));
+    setSleepOnset(result.sleep_onset);
   }
 
   async function setStatus(annotation: Annotation, status: Annotation["status"]) {
     const updated = await run("annotation", () => api.updateAnnotation(annotation, status));
-    if (updated) setAnnotations((items) => items.map((item) => (item.id === updated.id ? updated : item)));
+    if (updated) {
+      setAnnotations((items) => items.map((item) => (item.id === updated.id ? updated : item)));
+      if (meta) setSpindleOnsetReport(await api.fetchSpindleSleepOnset(meta.file_id));
+    }
   }
 
   async function remove(annotation: Annotation) {
     const ok = await run("annotation", () => api.deleteAnnotation(annotation.id));
-    if (ok !== null) setAnnotations((items) => items.filter((item) => item.id !== annotation.id));
+    if (ok !== null) {
+      setAnnotations((items) => items.filter((item) => item.id !== annotation.id));
+      if (meta) setSpindleOnsetReport(await api.fetchSpindleSleepOnset(meta.file_id));
+    }
   }
 
   async function saveManualAnnotation() {
@@ -222,6 +245,30 @@ function App() {
     if (saved) {
       setAnnotations((items) => [saved, ...items]);
       setLlmResult(null);
+      setSpindleOnsetReport(await api.fetchSpindleSleepOnset(meta.file_id));
+    }
+  }
+
+  async function saveCurrentEpoch() {
+    if (!meta) return;
+    const epochIndex = Math.floor(startSec / 30);
+    const saved = await run("sleep-epoch", () => api.saveSleepEpoch({
+      fileId: meta.file_id,
+      epochIndex,
+      stage: epochStage,
+      spindlePresent,
+      notes: epochNotes
+    }));
+    if (!saved) return;
+    setSleepEpochs(await api.fetchSleepEpochs(meta.file_id));
+    setSleepOnset(await api.fetchSleepOnset(meta.file_id));
+    const nextStart = (epochIndex + 1) * 30;
+    if (nextStart + 30 <= meta.duration_sec) {
+      setStartSec(nextStart);
+      const nextWindow = await api.fetchWindow({ fileId: meta.file_id, startSec: nextStart, durationSec: 30, channels: selectedChannels, filterType });
+      setWindowData(nextWindow);
+      setSegmentStart(nextStart);
+      setSegmentEnd(nextStart + 30);
     }
   }
 
@@ -252,6 +299,7 @@ function App() {
     });
     if (imported) {
       setAnnotations((items) => [...imported, ...items]);
+      setSpindleOnsetReport(await api.fetchSpindleSleepOnset(meta.file_id));
       const first = imported[0];
       setSegmentStart(first.start_time_sec);
       setSegmentEnd(first.end_time_sec);
@@ -272,7 +320,7 @@ function App() {
 
   React.useEffect(() => {
     const saved = localStorage.getItem(WORKSPACE_KEY);
-    void api.fetchJobConfig().then((config) => setMaxBatchSegments(config.max_segments_per_job)).catch(() => undefined);
+    void api.fetchJobConfig().then((config) => { setMaxBatchSegments(config.max_segments_per_job); setPromptConfig(config.prompt_config); }).catch(() => undefined);
     if (!saved) {
       setRestored(true);
       return;
@@ -280,20 +328,22 @@ function App() {
     try {
       const state = JSON.parse(saved);
       setStartSec(state.startSec ?? 0);
-      setDurationSec(state.durationSec ?? 10);
+      setDurationSec(state.durationSec === 60 ? 60 : 30);
       setFilterType(state.filterType ?? "broad");
       setChannelsText(state.channelsText ?? "1-12");
       setBatchStart(state.batchStart ?? 0);
       setBatchEnd(state.batchEnd ?? 60);
-      setBatchSegmentDuration(state.batchSegmentDuration ?? 10);
       void api.fetchFileMetadata(state.fileId).then(async (metadata) => {
         setMeta(metadata);
         const ann = await api.fetchAnnotations(metadata.file_id).catch(() => []);
         setAnnotations(ann);
+        setSleepEpochs(await api.fetchSleepEpochs(metadata.file_id).catch(() => []));
+        setSleepOnset(await api.fetchSleepOnset(metadata.file_id).catch(() => null));
+        setSpindleOnsetReport(await api.fetchSpindleSleepOnset(metadata.file_id).catch(() => null));
         const window = await api.fetchWindow({
           fileId: metadata.file_id,
           startSec: state.startSec ?? 0,
-          durationSec: state.durationSec ?? 10,
+          durationSec: state.durationSec === 60 ? 60 : 30,
           channels: parseChannels(state.channelsText ?? "1-12", metadata.channel_count),
           filterType: state.filterType ?? "broad"
         });
@@ -325,9 +375,13 @@ function App() {
       void api.fetchAnalysisJob(activeJob.id).then(async (job) => {
         setActiveJob(job);
         if (job.status === "completed" || job.status === "failed" || job.status === "cancelled") {
-          if (meta) setAnnotations(await api.fetchAnnotations(meta.file_id));
+          if (meta) {
+            setAnnotations(await api.fetchAnnotations(meta.file_id));
+            setSpindleOnsetReport(await api.fetchSpindleSleepOnset(meta.file_id));
+          }
         } else if (meta && job.completed_segments !== activeJob.completed_segments) {
           setAnnotations(await api.fetchAnnotations(meta.file_id));
+          setSpindleOnsetReport(await api.fetchSpindleSleepOnset(meta.file_id));
         }
       }).catch((err) => setError(err instanceof Error ? err.message : String(err)));
     }, 1500);
@@ -345,15 +399,23 @@ function App() {
     return () => window.clearInterval(timer);
   }, [busy, singleAnalysisEstimate]);
 
+  React.useEffect(() => {
+    const current = sleepEpochs.find((item) => item.epoch_index === Math.floor(startSec / 30));
+    setEpochStage(current?.stage ?? "uncertain");
+    setSpindlePresent(current?.spindle_present ?? false);
+    setEpochNotes(current?.notes ?? "");
+  }, [startSec, sleepEpochs]);
+
   async function startBatch() {
-    if (!meta) return;
+    if (!meta || !promptConfig) return;
     const job = await run("batch", () => api.startAnalysisJob({
       fileId: meta.file_id,
       startSec: batchStart,
       endSec: batchEnd,
       segmentDurationSec: batchSegmentDuration,
       channels: selectedChannels,
-      filterType
+      filterType,
+      promptConfig
     }));
     if (job) setActiveJob(job);
   }
@@ -371,12 +433,16 @@ function App() {
     setMeta(null);
     setWindowData(null);
     setAnnotations([]);
+    setSleepEpochs([]);
+    setSleepOnset(null);
+    setSpindleOnsetReport(null);
+    setN2Assessments([]);
     setActiveJob(null);
     setRenderedImage(null);
     setLlmResult(null);
     setStartSec(0);
     setSegmentStart(0);
-    setSegmentEnd(10);
+    setSegmentEnd(30);
     setBatchStart(0);
     setBatchEnd(60);
     setSingleAnalysisProgress(0);
@@ -384,25 +450,30 @@ function App() {
     localStorage.removeItem(WORKSPACE_KEY);
   }
 
-  const batchSegmentCount = Math.max(0, Math.ceil((batchEnd - batchStart) / Math.max(1, batchSegmentDuration)));
+  const batchRangeDuration = Math.max(0, batchEnd - batchStart);
 
-  const plot = buildPlot(windowData, annotations, { start: segmentStart, end: segmentEnd, active: annotationMode });
-  const acceptedCount = annotations.filter((item) => item.status === "accepted").length;
+  const plot = buildPlot(windowData, annotations, spindleOnsetReport, { start: segmentStart, end: segmentEnd, active: annotationMode });
   const proposedCount = annotations.filter((item) => item.status === "proposed").length;
+  const acceptedSpindleCount = annotations.filter((item) => item.status === "accepted").length;
+  const selectedReviewedEpoch = activeJob?.reviewed_epochs?.find((item) => item.epoch_index === Math.floor(startSec / 30)) ?? activeJob?.reviewed_epochs?.[0] ?? null;
+  const batchTimeline = activeJob ? Array.from(
+    { length: Math.max(0, Math.ceil(activeJob.end_sec / 30) - Math.floor(activeJob.start_sec / 30)) },
+    (_, index) => Math.floor(activeJob.start_sec / 30) + index
+  ) : [];
 
   return (
     <main className="app-frame">
       <header className="topbar">
-        <div className="product-mark"><BrainCircuit size={21} /><div><strong>Spindle Lab</strong><span>EEG annotation workspace</span></div></div>
+        <div className="product-mark"><BrainCircuit size={21} /><div><strong>Sleep Onset Lab</strong><span>30-second epoch scoring</span></div></div>
         <div className="dataset-status">
           <span className={`status-dot ${meta ? "ready" : ""}`} />
           <div><strong>{meta?.filename ?? "No recording loaded"}</strong><span>{meta ? `${meta.channel_count} channels / ${meta.sampling_rate} Hz / ${formatTime(meta.duration_sec)}` : "Upload a MATLAB EEG recording to begin"}</span></div>
         </div>
         <div className="topbar-metrics">
-          <span><b>{proposedCount}</b> proposed</span>
-          <span><b>{acceptedCount}</b> accepted</span>
-          <button className="export-action" disabled={!meta} onClick={() => meta && void api.exportAnnotations(meta.file_id)}><Download size={15} /> Export</button>
-          <label className={`import-annotations ${!meta ? "disabled" : ""}`}><FileUp size={15} /> Import TXT<input type="file" accept=".txt,text/plain" disabled={!meta} onChange={(event) => { const file = event.target.files?.[0]; event.currentTarget.value = ""; if (file) void importAnnotationFile(file); }} /></label>
+          <span><b>{acceptedSpindleCount}</b> accepted spindles</span>
+          <span><b>{spindleOnsetReport?.detected ? formatTime(spindleOnsetReport.sleep_onset_time_sec ?? 0) : "—"}</b> spindle onset</span>
+          <button className="export-action" disabled={!meta} onClick={() => meta && void api.exportSleepEpochs(meta.file_id)}><Download size={15} /> Export spindle GT</button>
+          <label className={`import-annotations ${!meta ? "disabled" : ""}`}><FileUp size={15} /> Import spindle TXT<input type="file" accept=".txt,text/plain" disabled={!meta} onChange={(event) => { const file = event.target.files?.[0]; event.currentTarget.value = ""; if (file) void importAnnotationFile(file); }} /></label>
           <button className="remove-action" disabled={!meta} onClick={() => void removeCurrentFile()}><Trash2 size={15} /> Remove</button>
           <label className="upload-action"><FileUp size={15} /> Import File<input type="file" accept=".mat,.edf" onChange={(event) => event.target.files?.[0] && void onUpload(event.target.files[0])} /></label>
         </div>
@@ -419,7 +490,7 @@ function App() {
             <div className="field"><label>Filter band</label><div className="segmented">{filterOptions.map((option) => <button key={option} className={filterType === option ? "active" : ""} onClick={() => setFilterType(option)}>{option}</button>)}</div></div>
             <div className="field"><label>Channels</label><input value={channelsText} onChange={(event) => setChannelsText(event.target.value)} placeholder="1-12 or 1,2,34" /><small>{selectedChannels.length} selected, max 32</small></div>
             <div className="grid-2">
-              <div className="field"><label>Start time</label><div className="input-unit"><input type="number" value={startSec} onChange={(event) => setStartSec(Number(event.target.value))} /><span>sec</span></div><small>{formatMinutes(startSec)}</small></div>
+              <div className="field"><label>Epoch start</label><div className="input-unit"><input type="number" step="30" value={startSec} onChange={(event) => setStartSec(Math.max(0, Math.floor(Number(event.target.value) / 30) * 30))} /><span>sec</span></div><small>Epoch #{Math.floor(startSec / 30) + 1}</small></div>
               <div className="field"><label>Window</label><select value={durationSec} onChange={(event) => setDurationSec(Number(event.target.value))}>{durationOptions.map((value) => <option key={value} value={value}>{value} sec</option>)}</select></div>
             </div>
             <button className="primary" disabled={!meta || busy === "window"} onClick={() => void loadWindow()}>{busy === "window" ? <Loader2 className="spin" size={15} /> : <Play size={15} />} Load signal window</button>
@@ -429,19 +500,32 @@ function App() {
             <div className="section-label">Current analysis scope</div>
             <div className="current-scope">
               <Clock3 size={15} />
-              <div><strong>{windowData ? `${windowData.start_sec.toFixed(2)} - ${(windowData.start_sec + windowData.duration_sec).toFixed(2)} s` : "No window loaded"}</strong><span>Analysis follows the visible signal window</span></div>
+              <div><strong>{windowData ? `${windowData.start_sec.toFixed(2)} - ${(windowData.start_sec + windowData.duration_sec).toFixed(2)} s` : "No window loaded"}</strong><span>Epochs are aligned to fixed 30-second boundaries</span></div>
             </div>
           </div>
-          <div className="control-section">
-            <div className="section-label">Batch analysis</div>
+          <details className="control-section evidence-automation">
+            <summary>Spindle evidence automation</summary>
+            <div className="evidence-automation-body">
             <div className="grid-2">
               <div className="field"><label>From</label><div className="input-unit"><input type="number" value={batchStart} onChange={(event) => setBatchStart(Number(event.target.value))} /><span>sec</span></div></div>
               <div className="field"><label>To</label><div className="input-unit"><input type="number" value={batchEnd} onChange={(event) => setBatchEnd(Number(event.target.value))} /><span>sec</span></div></div>
             </div>
-            <div className="field"><label>Seconds per segment</label><select value={batchSegmentDuration} onChange={(event) => setBatchSegmentDuration(Number(event.target.value))}>{[5, 10, 20, 30, 60].map((value) => <option key={value} value={value}>{value} seconds</option>)}</select></div>
-            <div className={`batch-estimate ${batchSegmentCount > maxBatchSegments ? "invalid" : ""}`}><span>{batchSegmentCount} segments</span><span>Maximum {maxBatchSegments}</span></div>
-            <button className="primary ai-action" disabled={!meta || batchSegmentCount < 1 || batchSegmentCount > maxBatchSegments || activeJob?.status === "running" || activeJob?.status === "queued"} onClick={() => void startBatch()}><Sparkles size={15} /> Start batch analysis</button>
-          </div>
+            <div className="field"><label>GPT review window</label><div className="fixed-window"><strong>30-second epoch</strong><span>+ 5 s boundary context on each side</span></div></div>
+            {promptConfig && <details className="prompt-config">
+              <summary>GPT prompt configuration</summary>
+              <div className="grid-2">
+                <div className="field"><label>Model</label><input value={promptConfig.model_name} onChange={(event) => setPromptConfig({ ...promptConfig, model_name: event.target.value })} /></div>
+                <div className="field"><label>Reasoning</label><select value={promptConfig.reasoning_effort} onChange={(event) => setPromptConfig({ ...promptConfig, reasoning_effort: event.target.value as GptPromptConfig["reasoning_effort"] })}>{["none", "low", "medium", "high", "xhigh"].map((value) => <option key={value}>{value}</option>)}</select></div>
+              </div>
+              <div className="field"><label>Verbosity</label><select value={promptConfig.verbosity} onChange={(event) => setPromptConfig({ ...promptConfig, verbosity: event.target.value as GptPromptConfig["verbosity"] })}>{["low", "medium", "high"].map((value) => <option key={value}>{value}</option>)}</select></div>
+              <div className="field"><label>System prompt</label><textarea value={promptConfig.system_prompt} onChange={(event) => setPromptConfig({ ...promptConfig, system_prompt: event.target.value })} /></div>
+              <div className="field"><label>User prompt template</label><textarea value={promptConfig.user_prompt_template} onChange={(event) => setPromptConfig({ ...promptConfig, user_prompt_template: event.target.value })} /></div>
+              <div className="field"><label>JSON schema / structured output</label><textarea value={promptConfig.json_schema} onChange={(event) => setPromptConfig({ ...promptConfig, json_schema: event.target.value })} /></div>
+            </details>}
+            <div className="batch-estimate"><span>{batchRangeDuration.toFixed(0)} seconds selected</span><span>Up to {maxBatchSegments} candidates</span></div>
+            <button className="primary ai-action" disabled={!meta || !promptConfig || batchRangeDuration <= 0 || activeJob?.status === "running" || activeJob?.status === "queued"} onClick={() => void startBatch()}><Sparkles size={15} /> Review YASA epochs with GPT</button>
+            </div>
+          </details>
           {meta && <details className="candidates"><summary>Source arrays</summary>{meta.detected_arrays.map((item) => <div key={item.key} className={item.key === meta.selected_data_key ? "candidate selected" : "candidate"}><span>{item.key}</span><small>{item.shape.join(" x ")} {item.role_hint ?? ""}</small></div>)}</details>}
           {error && <div className="error"><X size={15} /><span>{error}</span></div>}
         </aside>
@@ -453,20 +537,46 @@ function App() {
             <div className="signal-actions">
               <button title="Render broad image" disabled={!windowData || busy === "render"} onClick={() => void render("broad")}><Image size={15} /><span>Broad</span></button>
               <button title="Render sigma image" disabled={!windowData || busy === "render"} onClick={() => void render("sigma")}><Image size={15} /><span>Sigma</span></button>
-              <button className="analyze-window" disabled={!windowData || busy === "analyze"} onClick={() => void analyze()}>{busy === "analyze" ? <Loader2 className="spin" size={15} /> : <Sparkles size={15} />}<span>Analyze view</span></button>
+              <button className="analyze-window" title="Refresh the deterministic report from accepted spindles" disabled={!meta} onClick={() => meta && void api.fetchSpindleSleepOnset(meta.file_id).then(setSpindleOnsetReport).catch((err) => setError(err instanceof Error ? err.message : String(err)))}><Sparkles size={15} /><span>Refresh onset</span></button>
               <button className={annotationMode ? "select-window active" : "select-window"} title="Toggle box select" disabled={!windowData} onClick={() => setAnnotationMode((value) => !value)}><MousePointer2 size={15} /><span>Select</span></button>
-              <div className="navigation"><button title="Previous window" disabled={!meta} onClick={() => { const next = Math.max(0, startSec - durationSec); setStartSec(next); void loadWindow(next); }}><ChevronLeft size={17} /></button><button title="Next window" disabled={!meta} onClick={() => { const next = startSec + durationSec; setStartSec(next); void loadWindow(next); }}><ChevronRight size={17} /></button></div>
+              <div className="navigation"><button title="Previous epoch" disabled={!meta} onClick={() => { const next = Math.max(0, startSec - 30); setStartSec(next); void loadWindow(next); }}><ChevronLeft size={17} /></button><button title="Next epoch" disabled={!meta} onClick={() => { const next = startSec + 30; setStartSec(next); void loadWindow(next); }}><ChevronRight size={17} /></button></div>
             </div>
           </div>
+          {activeJob && <section className="epoch-review-strip">
+            <div className="epoch-strip-head"><div><span className="eyebrow">Epoch review timeline</span><strong>{activeJob.reviewed_epochs?.length ?? 0} reviewed / {batchTimeline.length} selected</strong></div><span>{activeJob.sleep_onset_time_sec != null ? `Sleep onset ${activeJob.sleep_onset_time_sec.toFixed(0)} s` : "No consecutive N2-like pair"}</span></div>
+            <div className="epoch-blocks">{batchTimeline.map((epochIndex) => { const review = activeJob.reviewed_epochs?.find((item) => item.epoch_index === epochIndex); return <button key={epochIndex} title={`Epoch ${epochIndex + 1} · ${epochIndex * 30}-${epochIndex * 30 + 30}s${review ? ` · ${review.label}` : " · not reviewed"}`} className={`${review?.label === "N2_like" ? "n2-like" : "not-n2-like"} ${activeJob.sleep_onset_epoch === epochIndex ? "onset" : ""} ${Math.floor(startSec / 30) === epochIndex ? "selected" : ""}`} onClick={() => { const next = epochIndex * 30; setStartSec(next); void loadWindow(next); }}><span>{epochIndex + 1}</span></button>; })}</div>
+          </section>}
           <div className="trace-stage">{windowData ? <Plot {...plot} onSelected={usePlotSelection} /> : <div className="empty-state"><div className="empty-wave"><Activity size={32} /></div><strong>No signal window loaded</strong><span>Import a recording and load a time window to inspect stacked EEG traces.</span></div>}</div>
-          <footer className="signal-footer"><span><span className="legend-line signal" /> Signal</span><span><span className="legend-line proposed" /> LLM proposed</span><span><span className="legend-line accepted" /> Accepted</span><span><span className="legend-line current" /> Current selection</span><span className="footer-hint">{annotationMode ? "Drag over the trace to set annotation time" : "Scroll to zoom / drag to inspect"}</span></footer>
+          <footer className="signal-footer"><span><span className="legend-line signal" /> Signal</span><span><span className="legend-line n2" /> N2-like epoch</span><span><span className="legend-line onset" /> Spindle onset</span><span><span className="legend-line accepted" /> Accepted spindle</span><span className="footer-hint">Derived from accepted spindle evidence</span></footer>
         </section>
 
         <aside className="review-panel">
-          <div className="panel-heading"><span>Review queue</span><PanelRight size={16} /></div>
-          <div className="selection-summary"><div><span>Selected interval</span><strong>{segmentStart.toFixed(2)} - {segmentEnd.toFixed(2)} s</strong></div><span className="filter-chip">{filterType}</span></div>
+          <div className="panel-heading"><span>Derived onset</span><PanelRight size={16} /></div>
+          <section className={`onset-result ${spindleOnsetReport?.detected ? "detected" : "pending"}`}>
+            <span>Spindle-supported sleep onset</span>
+            <strong>{spindleOnsetReport?.detected ? `${(spindleOnsetReport.sleep_onset_time_sec ?? 0).toFixed(0)} s` : "Not detected"}</strong>
+            <small>{spindleOnsetReport?.detected ? `Epochs ${(spindleOnsetReport.supporting_epochs[0] ?? 0) + 1}–${(spindleOnsetReport.supporting_epochs[1] ?? 0) + 1} · ${spindleOnsetReport.supporting_spindles.length} supporting spindles` : spindleOnsetReport?.reason ?? "Accept spindle events to derive the first consecutive N2-like pair."}</small>
+          </section>
+          {spindleOnsetReport && <section className="derived-onset-detail">
+            <div className="derived-method">Derived deterministically from accepted spindle evidence; GPT does not choose the onset time.</div>
+            <div className="onset-timeline" aria-label="Spindle-supported epoch timeline">
+              {spindleOnsetReport.epoch_summary.map((epoch) => <span key={epoch.epoch_index} className={`${epoch.label === "N2_like" ? "n2-like" : "not-n2-like"} ${spindleOnsetReport.sleep_onset_epoch === epoch.epoch_index ? "onset" : ""}`} title={`Epoch ${epoch.epoch_index + 1}: ${epoch.start_sec}-${epoch.end_sec}s · ${epoch.accepted_spindle_count} accepted spindle(s)`} />)}
+            </div>
+            {spindleOnsetReport.supporting_spindles.length > 0 && <div className="supporting-spindles"><span className="section-label">Supporting spindles</span>{spindleOnsetReport.supporting_spindles.map((spindle) => <div key={spindle.candidate_id}><strong>{spindle.start_sec.toFixed(2)}–{spindle.end_sec.toFixed(2)} s</strong><span>Epoch {spindle.epoch_index + 1} · {spindle.channel} · {spindle.confidence}</span></div>)}</div>}
+          </section>}
+          <details className="epoch-tool optional-staging">
+            <summary>Optional manual stage annotation</summary>
+            <div className="epoch-title"><div><span>Epoch #{Math.floor(startSec / 30) + 1}</span><strong>{Math.floor(startSec / 30) * 30}–{Math.floor(startSec / 30) * 30 + 30} s</strong></div><span className="epoch-duration">30 s</span></div>
+            <div className="stage-grid">{(["W", "N1", "N2", "N3", "R", "uncertain"] as SleepStage[]).map((stage) => <button key={stage} className={epochStage === stage ? `active ${stage.toLowerCase()}` : ""} onClick={() => setEpochStage(stage)}>{stage}</button>)}</div>
+            <div className="evidence-list">
+              <label><input type="checkbox" checked={spindlePresent} onChange={(event) => setSpindlePresent(event.target.checked)} /> Definite spindle present in this epoch</label>
+            </div>
+            <textarea value={epochNotes} onChange={(event) => setEpochNotes(event.target.value)} placeholder="Optional scoring notes" />
+            <button className="primary" disabled={!meta || busy === "sleep-epoch"} onClick={() => void saveCurrentEpoch()}>{busy === "sleep-epoch" ? <Loader2 className="spin" size={15} /> : <Check size={15} />} Save epoch & continue</button>
+          </details>
+          <div className="selection-summary"><div><span>Evidence interval</span><strong>{segmentStart.toFixed(2)} - {segmentEnd.toFixed(2)} s</strong></div><span className="filter-chip">{filterType}</span></div>
           <div className="manual-tool">
-            <div className="manual-tool-head"><span className="section-label">Manual annotation</span><button disabled={!windowData} onClick={() => setAnnotationMode((value) => !value)}><MousePointer2 size={13} /> {annotationMode ? "Selecting" : "Box select"}</button></div>
+            <div className="manual-tool-head"><span className="section-label">Spindle evidence (optional)</span><button disabled={!windowData} onClick={() => setAnnotationMode((value) => !value)}><MousePointer2 size={13} /> {annotationMode ? "Selecting" : "Box select"}</button></div>
             <div className="grid-2">
               <div className="field"><label>Start</label><div className="input-unit"><input type="number" step="0.01" value={segmentStart} onChange={(event) => setSegmentStart(Number(event.target.value))} /><span>sec</span></div><small>{formatMinutes(segmentStart)}</small></div>
               <div className="field"><label>End</label><div className="input-unit"><input type="number" step="0.01" value={segmentEnd} onChange={(event) => setSegmentEnd(Number(event.target.value))} /><span>sec</span></div><small>{formatMinutes(segmentEnd)}</small></div>
@@ -475,10 +585,40 @@ function App() {
             <button className="primary manual-save" disabled={!meta || !windowData || busy === "annotation"} onClick={() => void saveManualAnnotation()}>{busy === "annotation" ? <Loader2 className="spin" size={15} /> : <Plus size={15} />} Save manual spindle</button>
           </div>
           {renderedImage ? <img className="preview" src={renderedImage} alt="Rendered EEG segment" /> : <div className="preview-empty"><Image size={20} /><span>Rendered segment preview</span></div>}
-          {(busy === "analyze" || singleAnalysisProgress === 100) && <div className={`single-progress ${busy === "analyze" ? "running" : "completed"}`}><div className="job-progress-head"><div><span>Analyze view</span><strong>{Math.round(singleAnalysisProgress)}%</strong></div><span>{busy === "analyze" ? `${formatDuration(Math.max(0, singleAnalysisEstimate - singleAnalysisElapsed))} remaining` : `Completed in ${formatDuration(singleAnalysisElapsed)}`}</span></div><div className="progress-track"><span style={{ width: `${singleAnalysisProgress}%` }} /></div><div className="job-progress-meta"><span>{busy === "analyze" ? "LLM analysis in progress" : "Analysis complete"}</span><span>Estimated from recent analyses</span></div></div>}
-          {activeJob && <div className={`job-progress ${activeJob.status}`}><div className="job-progress-head"><div><span>Batch analysis</span><strong>{activeJob.progress_percent.toFixed(1)}%</strong></div><span>{activeJob.completed_segments} / {activeJob.total_segments}</span></div><div className="progress-track"><span style={{ width: `${activeJob.progress_percent}%` }} /></div><div className="job-progress-meta"><span>{activeJob.status}</span><span>{activeJob.estimated_remaining_sec != null ? `${formatDuration(activeJob.estimated_remaining_sec)} remaining` : "Estimating time"}</span></div><div className="job-progress-meta"><span>{activeJob.annotations_created} annotations</span><span>{activeJob.failed_segments} failed segments</span></div>{["queued", "running"].includes(activeJob.status) && <button className="cancel-job" onClick={() => void cancelBatch()}><Square size={11} /> Cancel analysis</button>}{activeJob.error && <small className="job-error">{activeJob.error}</small>}</div>}
+          {(busy === "analyze" || singleAnalysisProgress === 100) && <div className={`single-progress ${busy === "analyze" ? "running" : "completed"}`}><div className="job-progress-head"><div><span>N2 pair scoring</span><strong>{Math.round(singleAnalysisProgress)}%</strong></div><span>{busy === "analyze" ? `${formatDuration(Math.max(0, singleAnalysisEstimate - singleAnalysisElapsed))} remaining` : `Completed in ${formatDuration(singleAnalysisElapsed)}`}</span></div><div className="progress-track"><span style={{ width: `${singleAnalysisProgress}%` }} /></div><div className="job-progress-meta"><span>{busy === "analyze" ? "Reviewing 2 broad-band epochs" : "Epoch labels saved"}</span><span>Broad only · threshold 80%</span></div></div>}
+          {activeJob && <div className={`job-progress ${activeJob.status}`}>
+            <div className="job-progress-head"><div><span>Spindle evidence batch</span><strong>{activeJob.progress_percent.toFixed(1)}%</strong></div><span>{activeJob.completed_segments} / {activeJob.total_segments}</span></div>
+            <div className="progress-track"><span style={{ width: `${activeJob.progress_percent}%` }} /></div>
+            <div className="job-progress-meta"><span>{activeJob.status}</span><span>{activeJob.estimated_remaining_sec != null ? `${formatDuration(activeJob.estimated_remaining_sec)} remaining` : "Estimating time"}</span></div>
+            <div className="job-progress-meta"><span>{activeJob.candidate_count ?? activeJob.total_segments} candidates</span><span>{activeJob.annotations_created} annotations</span></div>
+            <div className="job-progress-meta"><span>Filter {formatDuration(activeJob.candidate_detection_elapsed_sec ?? 0)}</span><span>Total {formatDuration(activeJob.elapsed_sec)}</span></div>
+            <div className="job-progress-meta"><span>{activeJob.failed_segments} failed segments</span><span>{activeJob.current_segment_start_sec != null ? `Reviewing ${activeJob.current_segment_start_sec.toFixed(2)}s` : "Waiting"}</span></div>
+            <details className="screening-candidates">
+              <summary>Step 1 YASA candidates ({activeJob.screening_candidates?.length ?? activeJob.candidate_segments?.length ?? 0})</summary>
+              <small className="screening-rule">YASA 0.6.5 defaults: 2 s STFT / 0.2 s step; 0.3 s correlation and RMS / 0.1 s step; 12–15 Hz; duration 0.5–2.0 s; relative power ≥ 0.20; correlation ≥ 0.65; RMS ≥ mean + 1.5 SD.</small>
+              <div className="screening-list">
+                {(activeJob.screening_candidates ?? activeJob.candidate_segments ?? []).map((candidate, index) => <button key={`${candidate.start_sec}-${candidate.peak_time_sec}-${index}`} onClick={() => { setStartSec(candidate.start_sec); void loadWindow(candidate.start_sec); }}>
+                  <span><strong>#{index + 1}</strong> peak {candidate.peak_time_sec.toFixed(2)} s</span>
+                  <span>{candidate.event_start_sec != null && candidate.event_end_sec != null ? `${candidate.event_start_sec.toFixed(2)}–${candidate.event_end_sec.toFixed(2)} s` : `${candidate.start_sec.toFixed(0)}–${candidate.end_sec.toFixed(0)} s`}</span>
+                  <small>relative power {candidate.spectral_ratio?.toFixed(3) ?? "legacy"} · {candidate.channels.join(", ") || "channel unavailable"}</small>
+                </button>)}
+              </div>
+            </details>
+            {["queued", "running"].includes(activeJob.status) && <button className="cancel-job" onClick={() => void cancelBatch()}><Square size={11} /> Cancel analysis</button>}
+            {activeJob.error && <small className="job-error">{activeJob.error}</small>}
+          </div>}
+          {selectedReviewedEpoch && <section className="gpt-epoch-result">
+            <div className="gpt-result-head"><div><span>GPT epoch review</span><strong>{selectedReviewedEpoch.accepted_spindle_count} definite spindle{selectedReviewedEpoch.accepted_spindle_count === 1 ? "" : "s"}</strong></div><span className={selectedReviewedEpoch.label === "N2_like" ? "positive" : "negative"}>{selectedReviewedEpoch.label}</span></div>
+            <div className="result-separation"><span>YASA hints</span><b>{selectedReviewedEpoch.yasa_candidates.length}</b></div>
+            <div className="yasa-hints">{selectedReviewedEpoch.yasa_candidates.map((item, index) => <span key={`${item.peak_time_sec}-${index}`}>{item.event_start_sec?.toFixed(2)}–{item.event_end_sec?.toFixed(2)} s · {item.channels.join(", ")}</span>)}</div>
+            <div className="result-separation"><span>GPT accepted</span><b>{selectedReviewedEpoch.gpt_result.definite_spindle_events.length}</b></div>
+            {selectedReviewedEpoch.gpt_result.definite_spindle_events.map((event) => <article className="reviewed-event" key={event.event_id}><div><strong>{event.start_sec.toFixed(2)}–{event.end_sec.toFixed(2)} s</strong><span>{event.duration_sec.toFixed(2)} s · {event.confidence}</span></div><small>{event.channels.join(", ")}</small><details><summary>Evidence checklist</summary>{Object.entries({ ...event.evidence, ...event.exclusion_checked }).map(([name, pass]) => <span key={name}>{pass ? "✓" : "×"} {name.split("_").join(" ")}</span>)}</details></article>)}
+            <div className="result-separation"><span>Rejected / uncertain</span><b>{selectedReviewedEpoch.gpt_result.rejected_or_uncertain_notes.length}</b></div>
+            {selectedReviewedEpoch.gpt_result.rejected_or_uncertain_notes.map((note, index) => <p className="uncertain-note" key={index}>{note}</p>)}
+            <small className="image-quality">Image quality: {selectedReviewedEpoch.gpt_result.image_quality}{selectedReviewedEpoch.gpt_result.image_quality_note ? ` · ${selectedReviewedEpoch.gpt_result.image_quality_note}` : ""}</small>
+          </section>}
           {llmResult && <div className={`llm-result ${llmResult.contains_definite_spindle ? "positive" : "negative"}`}><div><Sparkles size={15} /><strong>{llmResult.contains_definite_spindle ? "Definite spindle proposed" : "No definite spindle detected"}</strong></div><details><summary>View model response</summary><pre>{JSON.stringify(llmResult, null, 2)}</pre></details></div>}
-          <div className="queue-header"><div><span className="section-label">Annotations</span><small>{annotations.length} total</small></div><span>{proposedCount} pending</span></div>
+          <div className="queue-header"><div><span className="section-label">Spindle evidence</span><small>{annotations.length} events</small></div><span>{proposedCount} pending</span></div>
           <div className="annotation-list">
             {annotations.length === 0 && <div className="queue-empty"><Search size={20} /><strong>No annotations yet</strong><span>Run an analysis to populate the review queue.</span></div>}
             {annotations.map((annotation) => <article key={annotation.id} className={`annotation ${annotation.status}`}><div className="annotation-top"><span className="status-label">{annotation.status}</span><span className="confidence">{annotation.confidence ? `${Math.round(annotation.confidence * 100)}%` : "manual"}</span></div><strong>{annotation.start_time_sec.toFixed(2)} - {annotation.end_time_sec.toFixed(2)} s</strong><span className="channel-list">{annotation.channels.join(", ")}</span><div className="annotation-bottom"><small>{annotation.source} / {annotation.filter_type_used}</small><div className="icon-row"><button title="Accept annotation" onClick={() => void setStatus(annotation, "accepted")}><Check size={14} /></button><button title="Reject annotation" onClick={() => void setStatus(annotation, "rejected")}><X size={14} /></button><button title="Delete annotation" onClick={() => void remove(annotation)}><Trash2 size={14} /></button></div></div></article>)}
@@ -552,7 +692,12 @@ function parseAnnotationText(text: string, durationSec: number): Array<{ start: 
   return ranges;
 }
 
-function buildPlot(windowData: WindowResponse | null, annotations: Annotation[], selection: { start: number; end: number; active: boolean }) {
+function buildPlot(
+  windowData: WindowResponse | null,
+  annotations: Annotation[],
+  spindleOnsetReport: SpindleSleepOnsetReport | null,
+  selection: { start: number; end: number; active: boolean }
+) {
   const offsets = windowData?.data.map((_, index) => (windowData.data.length - index - 1) * 2.5) ?? [];
   const windowStart = windowData?.start_sec ?? 0;
   const windowEnd = windowData ? windowData.start_sec + windowData.duration_sec : 0;
@@ -587,6 +732,33 @@ function buildPlot(windowData: WindowResponse | null, annotations: Annotation[],
             line: { color: item.status === "proposed" ? "#d97706" : "#16a34a", width: 1 }
           }))
       : [];
+  const epochShapes = windowData
+    ? (spindleOnsetReport?.epoch_summary ?? [])
+        .filter((item) => item.label === "N2_like" && item.end_sec >= windowStart && item.start_sec <= windowEnd)
+        .map((item) => ({
+          type: "rect" as const,
+          xref: "x" as const,
+          yref: "paper" as const,
+          x0: item.start_sec,
+          x1: item.end_sec,
+          y0: 0,
+          y1: 1,
+          fillcolor: "rgba(99, 102, 241, 0.07)",
+          line: { color: "rgba(99, 102, 241, 0.45)", width: 1 }
+        }))
+    : [];
+  const onsetShape = windowData && spindleOnsetReport?.detected && spindleOnsetReport.sleep_onset_time_sec != null && spindleOnsetReport.sleep_onset_time_sec >= windowStart && spindleOnsetReport.sleep_onset_time_sec <= windowEnd
+    ? [{
+        type: "line" as const,
+        xref: "x" as const,
+        yref: "paper" as const,
+        x0: spindleOnsetReport.sleep_onset_time_sec,
+        x1: spindleOnsetReport.sleep_onset_time_sec,
+        y0: 0,
+        y1: 1,
+        line: { color: "#7c3aed", width: 2, dash: "dash" as const }
+      }]
+    : [];
   const selectionShape =
     windowData && selection.end > selection.start && selection.end >= windowStart && selection.start <= windowEnd
       ? [{
@@ -601,7 +773,7 @@ function buildPlot(windowData: WindowResponse | null, annotations: Annotation[],
           line: { color: selection.active ? "#087a62" : "#7aa99b", width: 1, dash: "dot" }
         }]
       : [];
-  const shapes = [...annotationShapes, ...selectionShape];
+  const shapes = [...epochShapes, ...annotationShapes, ...onsetShape, ...selectionShape];
   return {
     data: traces,
     layout: {

@@ -1,6 +1,18 @@
-# EEG Spindle Annotation MVP
+# Agent-Assisted Spindle-Supported Sleep Onset
 
-Web platform for uploading EEG `.mat` or `.edf` files, visualizing stacked clinical-style EEG windows, rendering selected segments, and asking a backend-only OpenAI vision call for conservative sleep spindle proposals.
+Web platform that extends conservative spindle candidate detection and agent verification into a deterministic sleep-onset estimate.
+
+## Operational sleep-onset definition
+
+Accepted spindle events are assigned to fixed, non-overlapping 30-second epochs using their start time. An epoch containing at least one accepted spindle is labelled `N2_like`; all other epochs are labelled `not_N2_like`. Sleep onset is the start of the first epoch in the first consecutive `N2_like` pair:
+
+```text
+Epoch i contains >= 1 accepted spindle
+Epoch i+1 contains >= 1 accepted spindle
+Sleep onset estimate = start(Epoch i)
+```
+
+This is a project-specific spindle-supported N2-like definition, not full clinical sleep staging. GPT verifies spindle candidates only; the epoch aggregation and sleep-onset decision are deterministic.
 
 ## Stack
 
@@ -54,28 +66,45 @@ Open `http://localhost:5173`.
 2. Confirm detected metadata and array candidates.
 3. Pick filter mode: `raw`, `broad`, or `sigma`.
 4. Enter channel ranges such as `1-12` or explicit channels such as `1,2,34`.
-5. Load a time window for interactive browsing.
-6. Select segment start/end seconds, for example `1654` to `1664`.
-7. Render a broad or sigma PNG.
-8. Click `Analyze with LLM`.
-9. Review proposed annotations. Accept, reject, or delete them.
+5. Run spindle evidence automation over the selected recording range.
+6. Accept only definite spindle proposals; reject uncertain candidates.
+7. Refresh the onset report. The UI highlights N2-like epochs, the first supporting pair, and the accepted spindle events used.
+8. Export spindle GT or request the structured JSON report.
 
-## Batch Analysis
+## Spindle Evidence Automation
 
-- Choose a start time, end time, and seconds per segment in `Batch analysis`.
-- The UI calculates the number of segments before submission.
-- A single job supports up to 500 segments.
-- Jobs run in the backend and expose live percentage, completed count, annotations created, failures, and estimated remaining time.
-- Refreshing the browser does not restart an active job. The workspace and active job are restored automatically.
+- Open `Spindle evidence automation` to scan a selected range for spindle-like candidates.
+- YASA 0.6.5 generates candidate hints; hints in the same fixed 30-second epoch are reviewed together.
+- GPT reviews the complete broad-band target epoch with up to 5 seconds of shaded boundary context on each side. Context events cannot be annotated.
+- Prompt, model, reasoning effort, verbosity, and the strict JSON schema are configurable per batch.
+- Every reviewed epoch stores YASA hints separately from GPT-accepted events, evidence/exclusion checklists, uncertainty notes, image quality, and its deterministic `N2_like`/`not_N2_like` label.
+- The first pair of consecutive `N2_like` reviewed epochs deterministically defines the spindle-supported sleep-onset estimate; GPT never chooses onset directly.
+- Spindle evidence does not automatically assign an epoch's sleep stage.
+- A single job supports up to 500 candidate windows and can be resumed after refresh.
 
 ## Export
 
-Use `Export` in the top bar to download a versioned JSON file containing:
+Use `Export spindle GT` in the top bar to download a CSV containing:
 
-- `schema_version`
-- recording metadata
-- all annotations and review statuses
-- analysis job history and progress metadata
+- fixed epoch index and time boundaries
+- `spindle_present` as the manual epoch-level label
+- the derived proxy timestamp when the first two consecutive epochs both contain a definite spindle
+
+This is a spindle-based sleep-onset proxy, not the paper's N2-based sleep-onset ground truth.
+After the first consecutive spindle-positive pair is confirmed, any missing earlier epochs are automatically stored and exported as `spindle_present=false`; existing labels are never overwritten. This assumes review proceeded chronologically from the recording start.
+
+## Sleep-onset JSON report
+
+`GET /api/spindle-sleep-onset/{file_id}` returns:
+
+- detected status and sleep-onset epoch/time
+- the two supporting epochs
+- all 30-second N2-like/not-N2-like epoch summaries
+- accepted spindle counts per epoch
+- the accepted spindle events supporting the decision
+- a method note that states the operational definition
+
+Only annotations with `status="accepted"` are consumed. Proposed, rejected, and uncertain candidates cannot trigger sleep onset.
 
 ## Supported Inputs
 

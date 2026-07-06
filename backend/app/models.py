@@ -10,18 +10,16 @@ JobStatus = Literal["queued", "running", "completed", "failed", "cancelled"]
 SleepStage = Literal["W", "N1", "N2", "N3", "R", "uncertain"]
 
 DEFAULT_SPINDLE_SYSTEM_PROMPT = """You are a conservative EEG sleep spindle annotation assistant.
-Annotate only definite sleep spindles visible in the target 30-second epoch. Boundary context is for
-visual continuity only and must never be annotated. A definite spindle must be a short rhythmic burst,
+Annotate only definite sleep spindles visible in the target candidate interval. A definite spindle must be a short rhythmic burst,
 last 0.5-2.0 seconds, be visually consistent with 11-16 Hz, show waxing-and-waning morphology, have
 multi-channel support or exceptionally clear single-channel support, and not be better explained by a
 sharp transient, K-complex alone, muscle activity, eye movement, baseline drift, random background,
 or another artifact. If there is meaningful uncertainty, do not annotate it."""
 
 DEFAULT_SPINDLE_USER_TEMPLATE = """Review the broad-band EEG image for subject {subject_id}, epoch
-{epoch_index}, target {epoch_start_sec}-{epoch_end_sec} recording seconds. Channels: {channels}.
-YASA hints: {yasa_candidates}. The image includes {boundary_context_before_sec}s before and
-{boundary_context_after_sec}s after the target epoch. Inspect the entire target epoch, not only YASA
-peaks. Return strict JSON only."""
+{epoch_index}, candidate interval {epoch_start_sec}-{epoch_end_sec} recording seconds. Channels: {channels}.
+YASA hints: {yasa_candidates}. The image is cropped to the spindle-candidate interval. Review only
+the visible candidate event(s) and return strict JSON only."""
 
 
 class ArrayCandidate(BaseModel):
@@ -125,6 +123,7 @@ class BatchAnalysisRequest(BaseModel):
     channels: list[int] = Field(default_factory=list)
     filter_type: FilterType = "broad"
     prompt_config: "GptPromptConfig | None" = None
+    review_with_gpt: bool = True
 
 
 class CandidateSegment(BaseModel):

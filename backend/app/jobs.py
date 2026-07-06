@@ -16,7 +16,6 @@ from .models import AnalysisJob, AnnotationInput, BatchAnalysisRequest, Candidat
 from .settings import JOB_FILE, LLM_REVIEW_WORKERS
 
 MAX_BATCH_SEGMENTS = 500
-BOUNDARY_CONTEXT_SEC = 5.0
 _lock = Lock()
 _running: set[str] = set()
 
@@ -67,7 +66,7 @@ def create_job(payload: BatchAnalysisRequest) -> AnalysisJob:
             candidates_by_epoch[key] = candidate
     candidates = sorted(candidates_by_epoch.values(), key=lambda item: item.start_sec)
     total = len(candidates)
-    if total < 1:
+    if total < 1 and payload.review_with_gpt:
         raise ValueError("No spindle-like candidates were found in the selected range.")
     if total > MAX_BATCH_SEGMENTS:
         raise ValueError(f"Batch analysis is limited to {MAX_BATCH_SEGMENTS} candidate segments per job.")
@@ -75,7 +74,7 @@ def create_job(payload: BatchAnalysisRequest) -> AnalysisJob:
     job = AnalysisJob(
         id=uuid.uuid4().hex,
         file_id=payload.file_id,
-        status="queued",
+        status="queued" if payload.review_with_gpt else "completed",
         start_sec=payload.start_sec,
         end_sec=end_sec,
         segment_duration_sec=payload.segment_duration_sec,
@@ -90,12 +89,16 @@ def create_job(payload: BatchAnalysisRequest) -> AnalysisJob:
         prompt_config=payload.prompt_config or GptPromptConfig(),
         created_at=now,
         updated_at=now,
+        completed_at=None if payload.review_with_gpt else now,
+        progress_percent=0 if payload.review_with_gpt else 100,
+        estimated_remaining_sec=0 if not payload.review_with_gpt else None,
     )
     with _lock:
         items = _load()
         items.append(job)
         _save(items)
-    _start(job.id)
+    if payload.review_with_gpt:
+        _start(job.id)
     return job
 
 
@@ -149,12 +152,14 @@ def _start(job_id: str) -> None:
 def _review_candidate(job: AnalysisJob, candidate: CandidateSegment) -> tuple[ReviewedEpoch, int]:
     # Keep the narrow sigma band inside the numeric candidate detector only.
     # Visual confirmation uses broad-band context to avoid amplifying narrow-band artifacts.
-    # Show extra signal around the fixed target epoch so a spindle crossing a
-    # 30-second boundary is not visually truncated.
     meta, _ = load_recording_metadata(job.file_id)
-    review_start_sec = max(0.0, candidate.start_sec - BOUNDARY_CONTEXT_SEC)
-    review_end_sec = min(meta.duration_sec, candidate.end_sec + BOUNDARY_CONTEXT_SEC)
     hints = [item for item in job.screening_candidates if candidate.start_sec <= item.peak_time_sec < candidate.end_sec]
+    # The detector already provides precise physiological event boundaries. Give
+    # the vision reviewer only the interval occupied by candidates in this epoch,
+    # rather than a visually dense 30-40 second trace.
+    bounded_hints = [item for item in hints if item.event_start_sec is not None and item.event_end_sec is not None]
+    review_start_sec = max(0.0, min((item.event_start_sec for item in bounded_hints), default=candidate.start_sec))
+    review_end_sec = min(meta.duration_sec, max((item.event_end_sec for item in bounded_hints), default=candidate.end_sec))
     png = render_segment_png(
         job.file_id, review_start_sec, review_end_sec, job.channels, "broad",
         target_start_sec=candidate.start_sec, target_end_sec=candidate.end_sec,
@@ -165,10 +170,9 @@ def _review_candidate(job: AnalysisJob, candidate: CandidateSegment) -> tuple[Re
     epoch_index = int(candidate.start_sec // 30)
     result = analyze_epoch_png(
         png=png, config=job.prompt_config, subject_id=subject_id, epoch_index=epoch_index,
-        epoch_start_sec=candidate.start_sec, epoch_end_sec=candidate.end_sec,
+        epoch_start_sec=review_start_sec, epoch_end_sec=review_end_sec,
         channels=channel_labels, yasa_candidates=hints,
-        context_before_sec=candidate.start_sec - review_start_sec,
-        context_after_sec=review_end_sec - candidate.end_sec,
+        context_before_sec=0.0, context_after_sec=0.0,
     )
     created = 0
     for event in result.definite_spindle_events:
@@ -185,13 +189,17 @@ def _review_candidate(job: AnalysisJob, candidate: CandidateSegment) -> tuple[Re
             )
         )
         created += 1
-    query = urlencode({"channels": ",".join(str(item) for item in job.channels)})
+    query = urlencode({
+        "channels": ",".join(str(item) for item in job.channels),
+        "start_sec": f"{review_start_sec:.3f}",
+        "end_sec": f"{review_end_sec:.3f}",
+    })
     reviewed = ReviewedEpoch(
         subject_id=subject_id, epoch_index=epoch_index, start_sec=candidate.start_sec,
         end_sec=candidate.end_sec,
         image_path=f"/api/review-epoch-image/{job.file_id}/{epoch_index}?{query}",
-        boundary_context_before_sec=candidate.start_sec - review_start_sec,
-        boundary_context_after_sec=review_end_sec - candidate.end_sec,
+        boundary_context_before_sec=0.0,
+        boundary_context_after_sec=0.0,
         yasa_candidates=hints, gpt_result=result,
         accepted_spindle_count=len(result.definite_spindle_events),
         label="N2_like" if result.definite_spindle_events else "not_N2_like",

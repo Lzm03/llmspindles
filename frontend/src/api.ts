@@ -134,13 +134,21 @@ export async function fetchSpindleSleepOnset(fileId: string): Promise<SpindleSle
   return readJson<SpindleSleepOnsetReport>(await fetch(`/api/spindle-sleep-onset/${encodeURIComponent(fileId)}`));
 }
 
-export async function exportSleepEpochs(fileId: string): Promise<void> {
-  const response = await fetch(`/api/sleep-epochs/export/${encodeURIComponent(fileId)}`);
-  if (!response.ok) {
-    await readJson(response);
-    return;
-  }
-  const blob = await response.blob();
+export function exportSleepEpochs(fileId: string, report: SpindleSleepOnsetReport): void {
+  const onset = report.sleep_onset_time_sec == null ? "" : report.sleep_onset_time_sec.toFixed(3);
+  const lastSupportingEpoch = report.supporting_epochs[report.supporting_epochs.length - 1];
+  const exportedEpochs = lastSupportingEpoch == null
+    ? report.epoch_summary
+    : report.epoch_summary.filter((epoch) => epoch.epoch_index <= lastSupportingEpoch);
+  const rows = [
+    "# criterion,first_two_consecutive_30s_epochs_with_definite_spindle",
+    `# spindle_based_onset_proxy_sec,${onset}`,
+    "epoch_index,start_sec,end_sec,spindle_present",
+    ...exportedEpochs.map((epoch) =>
+      `${epoch.epoch_index},${epoch.start_sec.toFixed(3)},${epoch.end_sec.toFixed(3)},${epoch.has_accepted_spindle}`
+    )
+  ];
+  const blob = new Blob([`${rows.join("\n")}\n`], { type: "text/csv;charset=utf-8" });
   const url = URL.createObjectURL(blob);
   const anchor = document.createElement("a");
   anchor.href = url;
@@ -196,7 +204,8 @@ export async function startAnalysisJob(args: {
   segmentDurationSec: number;
   channels: number[];
   filterType: FilterType;
-  promptConfig: GptPromptConfig;
+  promptConfig?: GptPromptConfig;
+  reviewWithGpt?: boolean;
 }): Promise<AnalysisJob> {
   return readJson<AnalysisJob>(
     await fetch("/api/analysis-jobs", {
@@ -209,7 +218,8 @@ export async function startAnalysisJob(args: {
         segment_duration_sec: args.segmentDurationSec,
         channels: args.channels,
         filter_type: args.filterType,
-        prompt_config: args.promptConfig
+        prompt_config: args.promptConfig,
+        review_with_gpt: args.reviewWithGpt ?? true
       })
     })
   );
@@ -229,6 +239,21 @@ export async function cancelAnalysisJob(jobId: string): Promise<AnalysisJob> {
 
 export async function fetchJobConfig(): Promise<{ max_segments_per_job: number; prompt_config: GptPromptConfig }> {
   return readJson(await fetch("/api/analysis-jobs/config"));
+}
+
+export async function exportYasaCandidates(jobId: string, fileId: string): Promise<void> {
+  const response = await fetch(`/api/analysis-jobs/${encodeURIComponent(jobId)}/yasa-candidates.csv`);
+  if (!response.ok) {
+    await readJson(response);
+    return;
+  }
+  const blob = await response.blob();
+  const url = URL.createObjectURL(blob);
+  const anchor = document.createElement("a");
+  anchor.href = url;
+  anchor.download = `yasa-spindle-intervals-${fileId}.csv`;
+  anchor.click();
+  URL.revokeObjectURL(url);
 }
 
 export async function exportAnnotations(fileId: string): Promise<void> {

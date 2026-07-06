@@ -415,9 +415,27 @@ function App() {
       segmentDurationSec: batchSegmentDuration,
       channels: selectedChannels,
       filterType,
-      promptConfig
+      promptConfig,
+      reviewWithGpt: true
     }));
     if (job) setActiveJob(job);
+  }
+
+  async function runYasaOnly() {
+    if (!meta) return;
+    const job = await run("batch", () => api.startAnalysisJob({
+      fileId: meta.file_id,
+      startSec: batchStart,
+      endSec: batchEnd,
+      segmentDurationSec: batchSegmentDuration,
+      channels: selectedChannels,
+      filterType,
+      reviewWithGpt: false
+    }));
+    if (job) {
+      setActiveJob(job);
+      await api.exportYasaCandidates(job.id, job.file_id);
+    }
   }
 
   async function cancelBatch() {
@@ -472,7 +490,7 @@ function App() {
         <div className="topbar-metrics">
           <span><b>{acceptedSpindleCount}</b> accepted spindles</span>
           <span><b>{spindleOnsetReport?.detected ? formatTime(spindleOnsetReport.sleep_onset_time_sec ?? 0) : "—"}</b> spindle onset</span>
-          <button className="export-action" disabled={!meta} onClick={() => meta && void api.exportSleepEpochs(meta.file_id)}><Download size={15} /> Export spindle GT</button>
+          <button className="export-action" disabled={!meta || !spindleOnsetReport} onClick={() => meta && spindleOnsetReport && api.exportSleepEpochs(meta.file_id, spindleOnsetReport)}><Download size={15} /> Export spindle GT</button>
           <label className={`import-annotations ${!meta ? "disabled" : ""}`}><FileUp size={15} /> Import spindle TXT<input type="file" accept=".txt,text/plain" disabled={!meta} onChange={(event) => { const file = event.target.files?.[0]; event.currentTarget.value = ""; if (file) void importAnnotationFile(file); }} /></label>
           <button className="remove-action" disabled={!meta} onClick={() => void removeCurrentFile()}><Trash2 size={15} /> Remove</button>
           <label className="upload-action"><FileUp size={15} /> Import File<input type="file" accept=".mat,.edf" onChange={(event) => event.target.files?.[0] && void onUpload(event.target.files[0])} /></label>
@@ -523,6 +541,7 @@ function App() {
               <div className="field"><label>JSON schema / structured output</label><textarea value={promptConfig.json_schema} onChange={(event) => setPromptConfig({ ...promptConfig, json_schema: event.target.value })} /></div>
             </details>}
             <div className="batch-estimate"><span>{batchRangeDuration.toFixed(0)} seconds selected</span><span>Up to {maxBatchSegments} candidates</span></div>
+            <button className="primary" disabled={!meta || batchRangeDuration <= 0 || activeJob?.status === "running" || activeJob?.status === "queued"} onClick={() => void runYasaOnly()}><Download size={15} /> Run YASA only & export CSV</button>
             <button className="primary ai-action" disabled={!meta || !promptConfig || batchRangeDuration <= 0 || activeJob?.status === "running" || activeJob?.status === "queued"} onClick={() => void startBatch()}><Sparkles size={15} /> Review YASA epochs with GPT</button>
             </div>
           </details>
@@ -596,6 +615,7 @@ function App() {
             <details className="screening-candidates">
               <summary>Step 1 YASA candidates ({activeJob.screening_candidates?.length ?? activeJob.candidate_segments?.length ?? 0})</summary>
               <small className="screening-rule">YASA 0.6.5 defaults: 2 s STFT / 0.2 s step; 0.3 s correlation and RMS / 0.1 s step; 12–15 Hz; duration 0.5–2.0 s; relative power ≥ 0.20; correlation ≥ 0.65; RMS ≥ mean + 1.5 SD.</small>
+              <button className="export-action" onClick={() => void api.exportYasaCandidates(activeJob.id, activeJob.file_id)}><Download size={13} /> Export all YASA intervals</button>
               <div className="screening-list">
                 {(activeJob.screening_candidates ?? activeJob.candidate_segments ?? []).map((candidate, index) => <button key={`${candidate.start_sec}-${candidate.peak_time_sec}-${index}`} onClick={() => { setStartSec(candidate.start_sec); void loadWindow(candidate.start_sec); }}>
                   <span><strong>#{index + 1}</strong> peak {candidate.peak_time_sec.toFixed(2)} s</span>

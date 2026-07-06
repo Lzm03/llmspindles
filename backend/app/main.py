@@ -163,21 +163,27 @@ def auto_score_n2_pair(payload: AutoN2PairRequest) -> AutoN2PairResult:
 @app.get("/api/sleep-epochs/export/{file_id}", response_class=PlainTextResponse)
 def export_sleep_epochs(file_id: str) -> PlainTextResponse:
     try:
-        load_recording_metadata(file_id)
-        epochs = list_sleep_epochs(file_id)
-        proxy_epoch = find_spindle_onset_proxy(epochs)
-        if proxy_epoch is not None:
-            backfill_spindle_negatives(file_id, proxy_epoch.epoch_index)
-            epochs = list_sleep_epochs(file_id)
+        meta, _ = load_recording_metadata(file_id)
+        report = build_spindle_sleep_onset_report(
+            subject_id=Path(meta.filename).stem or file_id,
+            duration_sec=meta.duration_sec,
+            annotations=list_annotations(file_id),
+        )
         rows = [
             "# criterion,first_two_consecutive_30s_epochs_with_definite_spindle",
-            f"# spindle_based_onset_proxy_sec,{'' if proxy_epoch is None else f'{proxy_epoch.start_time_sec:.3f}'}",
+            f"# spindle_based_onset_proxy_sec,{'' if report.sleep_onset_time_sec is None else f'{report.sleep_onset_time_sec:.3f}'}",
             "epoch_index,start_sec,end_sec,spindle_present",
         ]
-        for item in epochs:
+        last_supporting_epoch = report.supporting_epochs[-1] if report.supporting_epochs else None
+        exported_epochs = (
+            report.epoch_summary
+            if last_supporting_epoch is None
+            else [item for item in report.epoch_summary if item.epoch_index <= last_supporting_epoch]
+        )
+        for item in exported_epochs:
             rows.append(
-                f"{item.epoch_index},{item.start_time_sec:.3f},{item.end_time_sec:.3f},"
-                f"{str(item.spindle_present).lower()}"
+                f"{item.epoch_index},{item.start_sec:.3f},{item.end_sec:.3f},"
+                f"{str(item.has_accepted_spindle).lower()}"
             )
         return PlainTextResponse("\n".join(rows) + "\n", media_type="text/csv")
     except FileNotFoundError as exc:
@@ -220,16 +226,24 @@ def render_segment(payload: SegmentRequest) -> RenderResponse:
 
 
 @app.get("/api/review-epoch-image/{file_id}/{epoch_index}")
-def review_epoch_image(file_id: str, epoch_index: int, channels: str | None = None) -> Response:
+def review_epoch_image(
+    file_id: str,
+    epoch_index: int,
+    channels: str | None = None,
+    start_sec: float | None = None,
+    end_sec: float | None = None,
+) -> Response:
     try:
         meta, _ = load_recording_metadata(file_id)
-        target_start = epoch_index * 30.0
-        target_end = target_start + 30.0
+        target_start = start_sec if start_sec is not None else epoch_index * 30.0
+        target_end = end_sec if end_sec is not None else target_start + 30.0
+        if target_end <= target_start:
+            raise ValueError("end_sec must be greater than start_sec.")
         if target_end > meta.duration_sec:
-            raise ValueError("A complete 30-second epoch is required.")
+            raise ValueError("Review interval exceeds the recording duration.")
         selected = [int(value) for value in channels.split(",") if value.strip()] if channels else []
         png = render_segment_png(
-            file_id, max(0.0, target_start - 5.0), min(meta.duration_sec, target_end + 5.0),
+            file_id, target_start, target_end,
             selected, "broad", target_start_sec=target_start, target_end_sec=target_end,
         )
         return Response(content=png, media_type="image/png")
@@ -330,6 +344,28 @@ def export_annotations(file_id: str) -> PlainTextResponse:
 def analysis_job_config() -> dict:
     config = GptPromptConfig().model_copy(update={"json_schema": json.dumps(EPOCH_REVIEW_SCHEMA, indent=2)})
     return {"max_segments_per_job": MAX_BATCH_SEGMENTS, "prompt_config": config.model_dump()}
+
+
+@app.get("/api/analysis-jobs/{job_id}/yasa-candidates.csv", response_class=PlainTextResponse)
+def export_yasa_candidates(job_id: str) -> PlainTextResponse:
+    """Export every physiological event returned by YASA before agent review."""
+    try:
+        job = get_job(job_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    rows = ["candidate_id,start_sec,end_sec,duration_sec,peak_sec,channels,relative_power"]
+    for index, candidate in enumerate(job.screening_candidates, start=1):
+        start = candidate.event_start_sec if candidate.event_start_sec is not None else candidate.start_sec
+        end = candidate.event_end_sec if candidate.event_end_sec is not None else candidate.end_sec
+        duration = candidate.event_duration_sec if candidate.event_duration_sec is not None else end - start
+        channels = "|".join(label.replace('"', '""') for label in candidate.channels)
+        relative_power = "" if candidate.spectral_ratio is None else f"{candidate.spectral_ratio:.4f}"
+        rows.append(
+            f'{index},{start:.3f},{end:.3f},{duration:.3f},{candidate.peak_time_sec:.3f},'
+            f'"{channels}",{relative_power}'
+        )
+    return PlainTextResponse("\n".join(rows) + "\n", media_type="text/csv")
 
 
 @app.post("/api/analysis-jobs", response_model=AnalysisJob)

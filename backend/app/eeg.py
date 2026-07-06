@@ -389,11 +389,40 @@ def filter_eeg(data: np.ndarray, sampling_rate: float, filter_type: FilterType) 
     high = min(high, nyquist * 0.95)
     if low >= high:
         return centered
-    b, a = signal.butter(4, [low / nyquist, high / nyquist], btype="bandpass")
-    padlen = 3 * max(len(a), len(b))
-    if centered.shape[1] <= padlen + 1:
-        return signal.lfilter(b, a, centered, axis=1)
-    return signal.filtfilt(b, a, centered, axis=1)
+    # SOS is numerically stable for the very low 0.5 Hz corner used at common
+    # EEG sampling rates. Direct-form coefficients can generate huge edge
+    # transients which then hide the real trace after display scaling.
+    sos = signal.butter(4, [low / nyquist, high / nyquist], btype="bandpass", output="sos")
+    default_padlen = 3 * (2 * len(sos) + 1)
+    if centered.shape[1] <= default_padlen + 1:
+        return signal.sosfilt(sos, centered, axis=1)
+    return signal.sosfiltfilt(sos, centered, axis=1)
+
+
+def filter_eeg_window(
+    data: np.ndarray,
+    start: int,
+    end: int,
+    sampling_rate: float,
+    filter_type: FilterType,
+) -> np.ndarray:
+    """Filter with real neighboring samples, then crop the requested window."""
+    if start < 0 or end > data.shape[1] or end <= start:
+        raise ValueError("Requested filter window is outside the recording.")
+    if filter_type == "raw":
+        return filter_eeg(data[:, start:end], sampling_rate, filter_type)
+
+    low = 0.5 if filter_type == "broad" else 11.0
+    context_cycles = 10.0 if filter_type == "broad" else 3.0
+    context_samples = max(
+        int(math.ceil((context_cycles / low) * sampling_rate)),
+        int(math.ceil(2.0 * sampling_rate)),
+    )
+    context_start = max(0, start - context_samples)
+    context_end = min(data.shape[1], end + context_samples)
+    filtered = filter_eeg(data[:, context_start:context_end], sampling_rate, filter_type)
+    crop_start = start - context_start
+    return filtered[:, crop_start : crop_start + (end - start)]
 
 
 def robust_scale(data: np.ndarray) -> np.ndarray:
@@ -414,8 +443,8 @@ def get_window(file_id: str, start_sec: float, duration_sec: float, channels_arg
     end = min(meta.sample_count, int((start_sec + duration_sec) * meta.sampling_rate))
     if end <= start:
         raise ValueError("Requested window is empty.")
-    segment = data[np.array(channels), start:end]
-    filtered = robust_scale(filter_eeg(segment, meta.sampling_rate, filter_type))
+    selected_data = data[np.array(channels)]
+    filtered = robust_scale(filter_eeg_window(selected_data, start, end, meta.sampling_rate, filter_type))
     stride = max(1, int(np.ceil(filtered.shape[1] / MAX_WINDOW_POINTS)))
     down = filtered[:, ::stride]
     times = (np.arange(start, end, stride)[: down.shape[1]] / meta.sampling_rate).astype(float)
@@ -450,7 +479,8 @@ def render_segment_png(
     end = min(meta.sample_count, int(end_sec * meta.sampling_rate))
     if end <= start:
         raise ValueError("Selected segment is empty.")
-    segment = robust_scale(filter_eeg(data[np.array(selected), start:end], meta.sampling_rate, filter_type))
+    selected_data = data[np.array(selected)]
+    segment = robust_scale(filter_eeg_window(selected_data, start, end, meta.sampling_rate, filter_type))
     times = np.arange(start, end) / meta.sampling_rate
     offsets = np.arange(len(selected))[::-1] * 2.5
 
